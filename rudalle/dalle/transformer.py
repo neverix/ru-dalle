@@ -123,7 +123,7 @@ class DalleTransformer(torch.nn.Module):
         self.final_layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
 
     def _get_layer_mask(self, layer_id):
-        if ((layer_id - 1) % 4 == 0):
+        if (layer_id - 1) % 4 == 0:
             layer_mask = self.col_mask
         elif layer_id != self.num_layers - 1:
             layer_mask = self.row_mask
@@ -153,7 +153,7 @@ class DalleTransformer(torch.nn.Module):
                                     use_cache=False, has_cache=False))
             else:
                 hidden_states, layer_cache = layer(
-                    hidden_states, mask, cache.get(i), mlp_cache=i == len(self.layers)-1, use_cache=use_cache)
+                    hidden_states, mask, cache.get(i), mlp_cache=i == len(self.layers) - 1, use_cache=use_cache)
                 cache[i] = layer_cache
         if gradient_checkpointing:
             hidden_states = torch.utils.checkpoint.checkpoint_sequential(
@@ -163,6 +163,14 @@ class DalleTransformer(torch.nn.Module):
 
         output = self.final_layernorm(hidden_states)
         return output, cache
+
+    def to_el(self):
+        """
+        Turn DALL-E transformer into an EL-attention transformer.
+        """
+        for layer in self.layers:
+            layer.to_el()
+        return self
 
 
 class DalleTransformerLayer(torch.nn.Module):
@@ -282,6 +290,18 @@ class DalleTransformerLayer(torch.nn.Module):
 
         return output, new_cache
 
+    def to_el(self):
+        """
+        Transform DALLE layer into EL-attention DALLE layer.
+        Call this again to undo the transformation.
+        """
+        old_attention = self.attention
+        if not isinstance(self.attention, ELAttention):
+            self.attention = ELAttention(self.attention)
+        else:
+            self.attention = self.attention.old()
+        return old_attention  # TODO?
+
 
 class DalleSelfAttention(torch.nn.Module):
     """
@@ -371,11 +391,12 @@ class DalleSelfAttention(torch.nn.Module):
             attention_scores = (attention_scores_scaled - attention_scores_scaled_maxes) * alpha
         return attention_scores
 
-    def forward(self, hidden_states, ltor_mask, use_cache=False, cache=None,):
+    def forward(self, hidden_states, ltor_mask, use_cache=False, cache=None, ):
         # hidden_states: [b, s, h]
         # ltor_mask: [1, 1, s, s]
         # cache: [3, b, s, h]  (key, value, output)
         # Attention heads. [b, s, hp]
+
         if use_cache and cache is not None:
             mixed_x_layer = self.query_key_value(hidden_states[:, cache[0].shape[-2]:, :])
         else:
@@ -389,7 +410,6 @@ class DalleSelfAttention(torch.nn.Module):
         key_layer = self._transpose_for_scores(mixed_key_layer)
         value_layer = self._transpose_for_scores(mixed_value_layer)
 
-        # Can be simplified, but I didn't for readability's sake
         if use_cache and cache is not None:
             past_key, past_value, past_output = cache
             key_layer = torch.cat((past_key, key_layer), dim=-2)
@@ -442,6 +462,115 @@ class DalleSelfAttention(torch.nn.Module):
         return output, cache
 
 
+class ELAttention(torch.nn.Module):
+    """
+    Memory-efficient EL-attention module.
+    Drop-in replacement for the DalleSelfAttention module
+    """
+
+    def __init__(self, attention):
+        super().__init__()
+
+        self.attention = attention
+        query, key, value = attention.query_key_value.weight.chunk(3, dim=0)
+        query_bias, key_bias, value_bias = attention.query_key_value.bias.chunk(3, dim=0)
+        output, output_bias = attention.dense.weight, attention.dense.bias
+
+        self.attention_dropout = attention.attention_dropout
+        self.output_dropout = attention.output_dropout
+
+        hidden_size, num_attention_heads, hidden_size_per_attention_head = (attention.hidden_size,
+                                                                            attention.num_attention_heads,
+                                                                            attention.hidden_size_per_attention_head)
+        (self.hidden_size,
+         self.num_attention_heads,
+         self.hidden_size_per_attention_head) = (
+            hidden_size,
+            num_attention_heads,
+            hidden_size_per_attention_head)
+
+        query, key, value, output = query.T, key.T, value.T, output.T
+        new_qk = (query.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
+                  @ key.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
+                  .transpose(-1, -2))
+        new_qb = (
+                query_bias.view(num_attention_heads, hidden_size_per_attention_head, 1).transpose(-1, -2)
+                @ key.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
+                .transpose(-1, -2))
+        new_kd = (query.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
+                  @ key_bias.view(1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
+                  .transpose(-1, -2))
+        new_ab = (query_bias.reshape(num_attention_heads, 1, hidden_size_per_attention_head)
+                  @ key_bias.reshape(num_attention_heads, hidden_size_per_attention_head, 1)).flatten()
+
+        # query/key parameters
+        self.qk, self.qb, self.kd, self.ab = new_qk, new_qb, new_kd, new_ab
+
+        new_output = (value.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
+                      @ output.view(num_attention_heads, hidden_size_per_attention_head, -1))
+        new_output_bias = value_bias @ output + output_bias
+        # output/value parameters
+        self.output, self.output_bias = new_output, new_output_bias
+
+    def old(self):
+        """
+        Return the regular DALLE self-attention module for undoing the EL-attention transformation.
+        """
+        return self.attention
+
+    def forward(self, x, ltor_mask, use_cache=False, cache=None):
+        # x: [b, s, h]
+        # ltor_mask: [1, 1, s, s]
+        # cache: [b, s, h]  past hidden states
+        if not use_cache:
+            raise NotImplementedError("EL-Attention only supports cached generation. "
+                                      "Set use_cache=True in generate_images.")
+
+        # Query. [b, s, h]
+        y = x
+
+        # Key/Value. [b, s, h]
+        x = y
+        if cache is not None:
+            x = torch.cat((cache, x), dim=1)
+
+        # Attention scores. [b, np, s, s]
+        attention_scores = (y.unsqueeze(1) @ self.qk @ x.transpose(-1, -2).unsqueeze(1)
+                            + self.qb @ x.transpose(-1, -2).unsqueeze(1)
+                            + x.unsqueeze(1) @ self.kd
+                            + self.ab.reshape((1, -1, 1, 1))) / math.sqrt(self.hidden_size_per_attention_head)
+
+        mask_value = 10000.0
+        ltor_mask = ltor_mask[:, :, -attention_scores.shape[-2]:]
+        attention_scores = torch.mul(attention_scores, ltor_mask) - mask_value * (1.0 - ltor_mask)
+
+        # Attention probabilities. [b, np, s, s]
+        attention_probs = torch.nn.Softmax(dim=-1)(attention_scores)
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.attention_dropout(attention_probs)
+
+        # Pseudo value layer.
+        # [b, np, s, hn]
+        value_layer = x.unsqueeze(1).repeat(1, self.num_attention_heads, 1, 1)
+
+        # Context layer.
+        # [b, np, s, hn]
+        context_layer = torch.matmul(attention_probs, value_layer) @ self.output
+
+        # Output is just the context layer - projection is integrated into self.output and self.output_bias.
+        output = context_layer.sum(dim=1) + self.output_bias
+
+        if use_cache and cache is not None:
+            output = torch.cat((cache, output), dim=-2)
+
+        if use_cache:
+            cache = output
+
+        output = self.output_dropout(output)
+        return output, cache
+
+
 class DalleMLP(torch.nn.Module):
     """
     MLP will take the input with h hidden state, project it to 4*h
@@ -464,8 +593,6 @@ class DalleMLP(torch.nn.Module):
         self.dropout = torch.nn.Dropout(output_dropout_prob)
         # Additional stabilization tweak for large models
         self.custom_relax = custom_relax
-
-
 
     def forward(self, hidden_states):
         # [b, s, 4hp]
