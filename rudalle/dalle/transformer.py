@@ -153,7 +153,8 @@ class DalleTransformer(torch.nn.Module):
                                     use_cache=False, has_cache=False))
             else:
                 hidden_states, layer_cache = layer(
-                    hidden_states, mask, cache.get(i), mlp_cache=i == len(self.layers) - 1, use_cache=use_cache)
+                    hidden_states, mask, cache.get(i), mlp_cache=i == len(self.layers) - 1 * 0,  # TODO turned off
+                    use_cache=use_cache)
                 cache[i] = layer_cache
         if gradient_checkpointing:
             hidden_states = torch.utils.checkpoint.checkpoint_sequential(
@@ -256,7 +257,8 @@ class DalleTransformerLayer(torch.nn.Module):
         # Self attention.
         attention_output, new_cache = self.attention(
             layernorm_output, ltor_mask,
-            cache=cache[:3] if use_cache and cache is not None else cache, use_cache=use_cache)
+            cache=cache[:3] if use_cache and cache is not None and isinstance(cache, tuple) else cache,
+            use_cache=use_cache)
 
         if self.cogview_sandwich_layernorm:
             attention_output = rescale_max(attention_output, self.cogview_layernorm_prescale)
@@ -295,12 +297,12 @@ class DalleTransformerLayer(torch.nn.Module):
         Transform DALLE layer into EL-attention DALLE layer.
         Call this again to undo the transformation.
         """
-        old_attention = self.attention
+        # old_attention = self.attention
         if not isinstance(self.attention, ELAttention):
             self.attention = ELAttention(self.attention)
         else:
             self.attention = self.attention.old()
-        return old_attention  # TODO?
+        return self.attention  # old_attention  # TODO?
 
 
 class DalleSelfAttention(torch.nn.Module):
@@ -468,13 +470,8 @@ class ELAttention(torch.nn.Module):
     Drop-in replacement for the DalleSelfAttention module
     """
 
-    def __init__(self, attention):
+    def __init__(self, attention, recompute_weights=False):
         super().__init__()
-
-        self.attention = attention
-        query, key, value = attention.query_key_value.weight.chunk(3, dim=0)
-        query_bias, key_bias, value_bias = attention.query_key_value.bias.chunk(3, dim=0)
-        output, output_bias = attention.dense.weight, attention.dense.bias
 
         self.attention_dropout = attention.attention_dropout
         self.output_dropout = attention.output_dropout
@@ -489,37 +486,49 @@ class ELAttention(torch.nn.Module):
             num_attention_heads,
             hidden_size_per_attention_head)
 
+        if recompute_weights:
+            self.attention = attention  # Recompute everything dynamically
+        else:
+            # query/key parameters
+            self.qk, self.qb, self.kd, self.ab, self.output, self.output_bias = self.compute_weights(attention)
+
+    def compute_weights(self, attention):
+        query, key, value = attention.query_key_value.weight.chunk(3, dim=0)
+        query_bias, key_bias, value_bias = attention.query_key_value.bias.chunk(3, dim=0)
+        output, output_bias = attention.dense.weight, attention.dense.bias
+
         query, key, value, output = query.T, key.T, value.T, output.T
-        new_qk = (query.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
-                  @ key.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
-                  .transpose(-1, -2))
-        new_qb = (
-                query_bias.view(num_attention_heads, hidden_size_per_attention_head, 1).transpose(-1, -2)
-                @ key.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
+
+        qk = (query.view(-1, self.num_attention_heads, self.hidden_size_per_attention_head).transpose(-2, -3)
+              @ key.view(-1, self.num_attention_heads, self.hidden_size_per_attention_head).transpose(-2, -3)
+              .transpose(-1, -2))
+        qb = (
+                query_bias.view(self.num_attention_heads, self.hidden_size_per_attention_head, 1).transpose(-1, -2)
+                @ key.view(-1, self.num_attention_heads, self.hidden_size_per_attention_head).transpose(-2, -3)
                 .transpose(-1, -2))
-        new_kd = (query.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
-                  @ key_bias.view(1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
-                  .transpose(-1, -2))
-        new_ab = (query_bias.reshape(num_attention_heads, 1, hidden_size_per_attention_head)
-                  @ key_bias.reshape(num_attention_heads, hidden_size_per_attention_head, 1)).flatten()
+        kd = (query.view(-1, self.num_attention_heads, self.hidden_size_per_attention_head).transpose(-2, -3)
+              @ key_bias.view(1, self.num_attention_heads, self.hidden_size_per_attention_head).transpose(-2, -3)
+              .transpose(-1, -2))
+        ab = (query_bias.reshape(self.num_attention_heads, 1, self.hidden_size_per_attention_head)
+              @ key_bias.reshape(self.num_attention_heads, self.hidden_size_per_attention_head, 1)).flatten()
 
-        # query/key parameters
-        self.qk, self.qb, self.kd, self.ab = new_qk, new_qb, new_kd, new_ab
+        output = (value.view(-1, self.num_attention_heads, self.hidden_size_per_attention_head).transpose(-2, -3)
+                  @ output.view(self.num_attention_heads, self.hidden_size_per_attention_head, -1))
+        output_bias = value_bias @ output + output_bias
 
-        new_output = (value.view(-1, num_attention_heads, hidden_size_per_attention_head).transpose(-2, -3)
-                      @ output.view(num_attention_heads, hidden_size_per_attention_head, -1))
-        new_output_bias = value_bias @ output + output_bias
-        # output/value parameters
-        self.output, self.output_bias = new_output, new_output_bias
+        return qk, qb, kd, ab, output, output_bias
 
     def old(self):
         """
         Return the regular DALLE self-attention module for undoing the EL-attention transformation.
         """
-        return self.attention
+        try:
+            return self.attention
+        except AttributeError:
+            raise NotImplementedError("Restoration not supported for recompute_weights=False")
 
-    def forward(self, x, ltor_mask, use_cache=False, cache=None):
-        # x: [b, s, h]
+    def forward(self, hidden_states, ltor_mask, use_cache=False, cache=None):
+        # hidden_states: [b, s, h]
         # ltor_mask: [1, 1, s, s]
         # cache: [b, s, h]  past hidden states
         if not use_cache:
@@ -527,18 +536,22 @@ class ELAttention(torch.nn.Module):
                                       "Set use_cache=True in generate_images.")
 
         # Query. [b, s, h]
-        y = x
-
         # Key/Value. [b, s, h]
-        x = y
+        x, y = hidden_states, hidden_states
         if cache is not None:
-            x = torch.cat((cache, x), dim=1)
+            y = y[..., cache.shape[1]:, :]
+
+        if hasattr(self, "attention"):
+            qk, qb, kd, ab, output, output_bias = self.compute_weights(self.attention)
+        else:
+            qk, qb, ab, kd = self.qk, self.qb, self.ab, self.qd
+            output, output_bias = self.output, self.output_bias
 
         # Attention scores. [b, np, s, s]
-        attention_scores = (y.unsqueeze(1) @ self.qk @ x.transpose(-1, -2).unsqueeze(1)
-                            + self.qb @ x.transpose(-1, -2).unsqueeze(1)
-                            + x.unsqueeze(1) @ self.kd
-                            + self.ab.reshape((1, -1, 1, 1))) / math.sqrt(self.hidden_size_per_attention_head)
+        attention_scores = (y.unsqueeze(1) @ qk @ x.transpose(-1, -2).unsqueeze(1)
+                            + qb @ x.transpose(-1, -2).unsqueeze(1)
+                            + y.unsqueeze(1) @ kd
+                            + ab.reshape((1, -1, 1, 1))) / math.sqrt(self.hidden_size_per_attention_head)
 
         mask_value = 10000.0
         ltor_mask = ltor_mask[:, :, -attention_scores.shape[-2]:]
@@ -556,10 +569,10 @@ class ELAttention(torch.nn.Module):
 
         # Context layer.
         # [b, np, s, hn]
-        context_layer = torch.matmul(attention_probs, value_layer) @ self.output
+        context_layer = torch.matmul(attention_probs, value_layer) @ output
 
         # Output is just the context layer - projection is integrated into self.output and self.output_bias.
-        output = context_layer.sum(dim=1) + self.output_bias
+        output = context_layer.sum(dim=1) + output_bias.sum(dim=0)
 
         if use_cache and cache is not None:
             output = torch.cat((cache, output), dim=-2)
